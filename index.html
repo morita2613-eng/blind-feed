@@ -66,7 +66,13 @@ const openDB = () => new Promise((res, rej) => {
 const req = r => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
 const txDone = tx => new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = tx.onabort = () => rej(tx.error); });
 const getMetas = async () => (await req(db.transaction('meta').objectStore('meta').getAll())).sort((a, b) => a.id - b.id);
-const getBlob = async id => { const r = await req(db.transaction('videos').objectStore('videos').get(id)); return r && r.blob; };
+const blobCache = new Map();
+const getBlob = async id => {
+  if (blobCache.has(id)) { const b = blobCache.get(id); blobCache.delete(id); blobCache.set(id, b); return b; }
+  const r = await req(db.transaction('videos').objectStore('videos').get(id)), b = r && r.blob;
+  if (b) { blobCache.set(id, b); while (blobCache.size > 5) blobCache.delete(blobCache.keys().next().value); }
+  return b;
+};
 
 /* ---------- util ---------- */
 const shuffle = a => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
@@ -97,13 +103,18 @@ function preloadNext() {
   if (!order.length) return;
   if (idx + 1 >= order.length) extend();
   ensure(vs[1 - c], idx + 1);
+  if (idx > 0) getBlob(order[idx - 1]).catch(() => {});
+  if (idx + 2 < order.length) getBlob(order[idx + 2]).catch(() => {});
 }
+let soundOn = false;
 function play(v) {
+  v.muted = !soundOn;
   const p = v.play();
   if (p && p.catch) p.catch(() => { v.muted = true; v.play().catch(() => {}); });
 }
 async function startSession() {
   busy = true;
+  blobCache.clear();
   ids = (await getMetas()).map(m => m.id);
   vs.forEach(v => { v.pause(); v.style.transition = 'none'; });
   vs[0].style.transform = 'translateY(0)'; vs[1].style.transform = 'translateY(100%)';
@@ -117,46 +128,94 @@ async function startSession() {
   if (!menu.classList.contains('open')) play(vs[0]);
   preloadNext();
 }
+let animSp = null;
 async function go(d) {
   if (busy || !order.length || menu.classList.contains('open')) return;
   const ni = idx + d;
   if (ni < 0) return;
   busy = true;
-  const cur = vs[c], sp = vs[1 - c];
+  const sp = vs[1 - c];
   await ensure(sp, ni);
   sp.currentTime = 0;
   sp.style.transition = 'none';
   sp.style.transform = 'translateY(' + d * 100 + '%)';
   sp.offsetHeight;
-  cur.style.transition = sp.style.transition = 'transform .28s cubic-bezier(.3,.7,.3,1)';
+  commit(d, ni);
+}
+function commit(d, ni) {
+  const cur = vs[c], sp = vs[1 - c];
+  animSp = sp;
+  sp.currentTime = 0;
+  cur.style.transition = sp.style.transition = 'transform .18s cubic-bezier(.2,.9,.3,1)';
   cur.style.transform = 'translateY(' + -d * 100 + '%)';
   sp.style.transform = 'translateY(0)';
   play(sp);
-  setTimeout(() => { cur.pause(); c = 1 - c; idx = ni; busy = false; preloadNext(); }, 300);
+  if (sp.p) sp.p.then(() => { if (sp.paused && sp === vs[c] || sp.paused && animSp === sp) play(sp); });
+  setTimeout(() => { cur.pause(); c = 1 - c; idx = ni; busy = false; animSp = null; preloadNext(); }, 190);
+}
+function snapBack(r) {
+  busy = true;
+  const cur = vs[c], sp = r.sp;
+  cur.style.transition = sp.style.transition = 'transform .18s cubic-bezier(.25,.8,.3,1)';
+  cur.style.transform = 'translateY(0)';
+  sp.style.transform = 'translateY(' + r.dir * 100 + '%)';
+  setTimeout(() => { busy = false; }, 190);
 }
 vs.forEach(v => v.addEventListener('ended', () => { if (v === vs[c]) go(1); }));
 
-/* iOSは初回タッチで音声を解禁（両方のvideo要素を一度ユーザー操作で再生） */
-function unlock() {
-  if (unlocked) return; unlocked = true;
-  vs.forEach((v, i) => {
-    v.muted = false;
-    if (i !== c && v.src) { const p = v.play(); if (p && p.then) p.then(() => v.pause()).catch(() => { v.muted = true; }); }
-  });
-  if (vs[c].paused && !menu.classList.contains('open')) play(vs[c]);
+function unlock(prime) {
+  const first = !soundOn;
+  soundOn = true;
+  vs[c].muted = false;
+  if (first) {
+    vs.forEach(v => {
+      v.muted = false;
+      if (prime && v !== vs[c] && v !== animSp && v.src) {
+        const p = v.play();
+        if (p && p.then) p.then(() => { if (v !== vs[c] && v !== animSp) v.pause(); }).catch(() => {});
+      }
+    });
+  }
+  if (vs[c].paused && !busy && !menu.classList.contains('open')) play(vs[c]);
 }
 
-/* ---------- gestures ---------- */
-let t0 = null;
-feed.addEventListener('touchstart', e => { const t = e.touches[0]; t0 = {x: t.clientX, y: t.clientY}; }, {passive: true});
-feed.addEventListener('touchmove', e => e.preventDefault(), {passive: false});
+/* ---------- gestures: 指に追従 ---------- */
+let dr = null;
+feed.addEventListener('touchstart', e => {
+  if (busy) { dr = null; return; }
+  const t = e.touches[0];
+  dr = {x: t.clientX, y: t.clientY, t: Date.now(), dir: 0, d: 0, blocked: false, sp: null};
+}, {passive: true});
+feed.addEventListener('touchmove', e => {
+  e.preventDefault();
+  if (!dr || busy || dr.blocked) return;
+  const t = e.touches[0], dy = t.clientY - dr.y, dx = t.clientX - dr.x;
+  if (!dr.dir) {
+    if (Math.abs(dy) < 3 || Math.abs(dy) < Math.abs(dx)) return;
+    const d = dy < 0 ? 1 : -1;
+    if (idx + d < 0) { dr.blocked = true; return; }
+    dr.dir = d; dr.sp = vs[1 - c];
+    ensure(dr.sp, idx + d);
+    vs.forEach(v => v.style.transition = 'none');
+  }
+  const d = dr.dir > 0 ? Math.min(0, dy) : Math.max(0, dy);
+  dr.d = d;
+  vs[c].style.transform = 'translateY(' + d + 'px)';
+  dr.sp.style.transform = 'translateY(calc(' + dr.dir * 100 + '% + ' + d + 'px))';
+}, {passive: false});
 feed.addEventListener('touchend', e => {
-  unlock();
-  if (!t0) return;
-  const t = e.changedTouches[0], dx = t.clientX - t0.x, dy = t.clientY - t0.y; t0 = null;
-  if (Math.abs(dy) > 50 && Math.abs(dy) > Math.abs(dx) * 1.3) go(dy < 0 ? 1 : -1);
-  else if (Math.abs(dx) < 10 && Math.abs(dy) < 10) { const v = vs[c]; v.paused ? play(v) : v.pause(); }
+  const r = dr; dr = null;
+  unlock(!(r && r.dir));
+  if (r && r.dir && !busy) {
+    const H = window.innerHeight, dt = Math.max(1, Date.now() - r.t), v = Math.abs(r.d) / dt;
+    if (Math.abs(r.d) > H * 0.1 || (v > 0.15 && Math.abs(r.d) > 12)) { busy = true; commit(r.dir, idx + r.dir); }
+    else snapBack(r);
+  } else if (r && !r.dir && !r.blocked && !busy) {
+    const t = e.changedTouches[0];
+    if (Math.abs(t.clientX - r.x) < 10 && Math.abs(t.clientY - r.y) < 10) { const v = vs[c]; v.paused ? play(v) : v.pause(); }
+  }
 });
+feed.addEventListener('touchcancel', () => { const r = dr; dr = null; if (r && r.dir && !busy) snapBack(r); });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) vs[c].pause();
   else if (order.length && !menu.classList.contains('open')) play(vs[c]);
@@ -240,6 +299,7 @@ $('#shuffleBtn').addEventListener('click', async () => { changed = false; menu.c
 
 /* ---------- boot ---------- */
 (async () => {
+  try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
   try { db = await openDB(); } catch (e) { toast('保存領域を開けません: ' + (e.message || e.name), 8000); return; }
